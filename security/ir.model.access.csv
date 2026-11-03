@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_ai_config_manager,ai.config manager,model_ai_config,group_ai_manager,1,1,1,1
+access_ai_llm_model_manager,ai.llm.model manager,model_ai_llm_model,group_ai_manager,1,1,1,1
