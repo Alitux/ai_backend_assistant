@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from datetime import datetime, time, timedelta
+import pytz
 from time import sleep
 
 import requests
@@ -103,15 +104,15 @@ TOOLS = [
     },
     {
         "name": "get_invoice_summary_by_period",
-        "description": "Obtiene montos facturados o adeudados en un rango de fechas.",
+        "description": "Obtiene totales facturados o adeudados, agrupados por moneda, con filtros opcionales.",
         "parameters": {
             "type": "object",
             "properties": {
+                "partner_name": {"type": "string"},
                 "date_from": {"type": "string"},
                 "date_to": {"type": "string"},
                 "state": {"type": "string"},
             },
-            "required": ["date_from", "date_to"],
         },
     },
 ]
@@ -140,6 +141,10 @@ class AiAgentService(models.AbstractModel):
 
     def _system_prompt(self, config):
         allowed = ", ".join(config.allowed_model_ids.mapped("model")) or "ninguno"
+        aliases = "; ".join(
+            "%s -> %s" % (item.keyword, item.model_id.model)
+            for item in config.keyword_ids
+        ) or "ninguno"
         return (
             "Sos un asistente interno. Respondé SIEMPRE en español, en una o dos frases, "
             "sin preguntas de aclaración y sin pedir confirmación. "
@@ -154,8 +159,11 @@ class AiAgentService(models.AbstractModel):
             "Para pedir datos de una persona o contacto, usá find_records con model='res.partner' y text=<nombre>. "
             "Nunca respondas 'no tengo permiso' sin haber ejecutado una herramienta. "
             "Si la herramienta devuelve datos, contestá con el dato; no preguntes nada más. "
+            "Alias configurados: %s. "
+            "Para totales de facturación usá get_invoice_summary_by_period; "
+            "informá la moneda de cada total y nunca asumas USD. "
             "Si el dato no está permitido, decí 'No tengo permiso para consultar X' en una línea. "
-            "No des explicaciones largas ni listes opciones." % allowed
+            "No des explicaciones largas ni listes opciones." % (allowed, aliases)
         )
 
     def _clean_body(self, body):
@@ -163,15 +171,129 @@ class AiAgentService(models.AbstractModel):
         text = html.unescape(text).replace("\xa0", " ")
         return re.sub(r"\s+", " ", text).strip()
 
+    def _parse_date_range(self, prompt, user):
+        text = prompt.lower()
+        tz = pytz.timezone(user.tz or "America/Argentina/Ushuaia")
+        today = datetime.now(tz).date()
+        months = {
+            "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+            "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+            "septiembre": 9, "setiembre": 9, "octubre": 10,
+            "noviembre": 11, "diciembre": 12,
+        }
+        if "hoy" in text:
+            return today, today, "hoy"
+        if "ayer" in text:
+            day = today - timedelta(days=1)
+            return day, day, "ayer"
+        if "mañana" in text:
+            day = today + timedelta(days=1)
+            return day, day, "mañana"
+        if "este mes" in text:
+            first = today.replace(day=1)
+            next_month = (first + timedelta(days=32)).replace(day=1)
+            last = next_month - timedelta(days=1)
+            return first, last, "este mes"
+        for name, month in months.items():
+            if name in text:
+                match = re.search(r"\b(20\d{2})\b", text)
+                year = int(match.group(1)) if match else today.year
+                first = datetime(year, month, 1).date()
+                next_month = (first + timedelta(days=32)).replace(day=1)
+                last = next_month - timedelta(days=1)
+                return first, last, "%s %s" % (name.capitalize(), year)
+        return None
+
+    def _date_domain(self, model, date_field, day_from, day_to, user):
+        field = model._fields[date_field]
+        if field.type == "datetime":
+            tz = pytz.timezone(user.tz or "America/Argentina/Ushuaia")
+            start = tz.localize(datetime.combine(day_from, time.min)).astimezone(
+                pytz.utc).replace(tzinfo=None)
+            end = tz.localize(datetime.combine(
+                day_to + timedelta(days=1), time.min)).astimezone(
+                pytz.utc).replace(tzinfo=None)
+            return [(date_field, ">=", start), (date_field, "<", end)]
+        return [(date_field, ">=", day_from), (date_field, "<=", day_to)]
+
+    def _format_record(self, record, tz):
+        parts = []
+        if record.get("appointment_date"):
+            value = record["appointment_date"]
+            local = pytz.utc.localize(value).astimezone(tz)
+            parts.append(local.strftime("%d/%m %H:%M"))
+        if record.get("patient_id"):
+            parts.append(record["patient_id"][1])
+        if record.get("doctor_id"):
+            parts.append(record["doctor_id"][1])
+        if record.get("state"):
+            parts.append(record["state"])
+        if not parts:
+            parts.append(record.get("display_name") or "Registro %s" % record.get("id"))
+        return " — ".join(parts)
+
+    def _route_prompt(self, config, user, prompt):
+        text = prompt.lower()
+        aliases = [
+            item for item in config.keyword_ids
+            if item.keyword and item.keyword.lower() in text
+        ]
+        if not aliases:
+            return None
+        alias = max(aliases, key=lambda item: len(item.keyword or ""))
+        model_name = alias.model_id.model
+        if not self._allowed(config, model_name):
+            return None
+        date_range = self._parse_date_range(prompt, user)
+        if not date_range:
+            return None
+        day_from, day_to, label = date_range
+        model = self.env[model_name].with_user(user)
+        date_field = self._pick_date_field(model)
+        if not date_field:
+            return None
+        domain = self._date_domain(model, date_field, day_from, day_to, user)
+        count = model.search_count(domain)
+        list_intent = any(
+            word in text for word in (
+                "quien", "quiénes", "quienes", "cual", "cuáles",
+                "cuales", "lista", "detalle", "para quienes",
+            )
+        )
+        if not list_intent:
+            return "Hay %s %s %s." % (count, alias.keyword, label)
+        fields_list = ["display_name"]
+        for name in ("appointment_date", "patient_id", "doctor_id", "state"):
+            if name in model._fields:
+                fields_list.append(name)
+        records = model.search_read(domain, fields=fields_list, limit=20)
+        if not records:
+            return "No hay %s %s." % (alias.keyword, label)
+        tz = pytz.timezone(user.tz or "America/Argentina/Ushuaia")
+        lines = [self._format_record(record, tz) for record in records]
+        return "Hay %s %s %s:\n- %s" % (
+            count, alias.keyword, label, "\n- ".join(lines))
+
+    def _looks_like_data_query(self, prompt):
+        text = prompt.lower()
+        return any(word in text for word in (
+            "cuanto", "cuánto", "cuantos", "cuántos", "factur",
+            "turno", "emergencia", "contacto", "correo", "mail",
+            "lista", "quien", "cual", "saldo", "deuda",
+        ))
+
     def _chat_with_fallback(self, config, user, prompt):
         models = config.model_ids.filtered(lambda model: model.active)
         models = models.sorted(key=lambda model: not model.is_default)
+        force_tool = self._looks_like_data_query(prompt)
         for model in models:
             try:
                 if config.provider == "anthropic":
-                    answer = self._anthropic_chat(config, model, user, prompt)
+                    answer = self._anthropic_chat(
+                        config, model, user, prompt, force_tool=force_tool)
                 else:
-                    answer = self._openai_chat(config, model, user, prompt)
+                    answer = self._openai_chat(
+                        config, model, user, prompt, force_tool=force_tool)
                 if answer and answer != _("No pude completar la consulta."):
                     return answer
             except requests.exceptions.HTTPError as error:
@@ -195,7 +317,9 @@ class AiAgentService(models.AbstractModel):
         prompt = self._clean_body(message.body)
         if not prompt:
             return False
-        answer = self._chat_with_fallback(config, user, prompt)
+        answer = self._route_prompt(config, user, prompt)
+        if not answer:
+            answer = self._chat_with_fallback(config, user, prompt)
         if answer:
             channel.sudo().message_post(
                 body=answer,
@@ -240,7 +364,7 @@ class AiAgentService(models.AbstractModel):
         )
         return any(marker in text for marker in markers)
 
-    def _openai_chat(self, config, model, user, prompt):
+    def _openai_chat(self, config, model, user, prompt, force_tool=False):
         url = self._base_url(config) + "/chat/completions"
         headers = {
             "Authorization": "Bearer %s" % config.api_key,
@@ -250,7 +374,7 @@ class AiAgentService(models.AbstractModel):
             {"role": "system", "content": self._system_prompt(config)},
             {"role": "user", "content": prompt},
         ]
-        tool_choice = "auto"
+        tool_choice = "required" if force_tool else "auto"
         forced = False
         retried = False
         for _iteration in range(5):
@@ -273,6 +397,9 @@ class AiAgentService(models.AbstractModel):
                     response.status_code,
                     response.text[:1000],
                 )
+                if response.status_code == 400 and tool_choice != "auto":
+                    tool_choice = "auto"
+                    continue
                 if not retried and response.status_code in (
                     400, 429, 500, 502, 503, 504,
                 ):
@@ -311,7 +438,7 @@ class AiAgentService(models.AbstractModel):
                 })
         return _("No pude completar la consulta.")
 
-    def _anthropic_chat(self, config, model, user, prompt):
+    def _anthropic_chat(self, config, model, user, prompt, force_tool=False):
         url = self._base_url(config) + "/messages"
         headers = {
             "x-api-key": config.api_key,
@@ -319,7 +446,7 @@ class AiAgentService(models.AbstractModel):
             "content-type": "application/json",
         }
         messages = [{"role": "user", "content": prompt}]
-        tool_choice = {"type": "auto"}
+        tool_choice = {"type": "any"} if force_tool else {"type": "auto"}
         forced = False
         for _iteration in range(5):
             payload = {
@@ -367,6 +494,7 @@ class AiAgentService(models.AbstractModel):
 
     def _execute_tool(self, name, args, user, config):
         args = args or {}
+        _logger.info("AI tool call %s args=%s", name, args)
         try:
             if name == "search_odoo_model":
                 return self._search_odoo_model(args, user, config)
@@ -386,7 +514,8 @@ class AiAgentService(models.AbstractModel):
             if name == "get_invoice_summary_by_period":
                 return self._get_invoice_summary(
                     user, config, args.get("date_from"),
-                    args.get("date_to"), args.get("state"))
+                    args.get("date_to"), args.get("state"),
+                    args.get("partner_name"))
             return {"error": "Herramienta desconocida: %s" % name}
         except Exception as error:
             _logger.exception("Error ejecutando herramienta IA %s", name)
@@ -590,22 +719,35 @@ class AiAgentService(models.AbstractModel):
         )
         return {"count": len(moves), "invoices": moves}
 
-    def _get_invoice_summary(self, user, config, date_from, date_to, state=None):
+    def _get_invoice_summary(self, user, config, date_from=None, date_to=None,
+                             state=None, partner_name=None):
         if not self._allowed(config, "account.move"):
             return {"error": "El modelo account.move no está habilitado."}
-        day_from = fields.Date.to_date(date_from)
-        day_to = fields.Date.to_date(date_to)
-        domain = [
-            ("move_type", "=", "out_invoice"),
-            ("invoice_date", ">=", day_from),
-            ("invoice_date", "<=", day_to),
-        ]
-        if state:
-            domain.append(("state", "=", state))
+        domain = [("move_type", "=", "out_invoice")]
+        if partner_name:
+            domain.append(("partner_id.name", "ilike", partner_name))
+        if date_from:
+            domain.append(("invoice_date", ">=", fields.Date.to_date(date_from)))
+        if date_to:
+            domain.append(("invoice_date", "<=", fields.Date.to_date(date_to)))
+        domain.append(("state", "=", state or "posted"))
         moves = self.env["account.move"].with_user(user).search(domain)
+        totals = {}
+        for move in moves:
+            currency = move.currency_id.name or "N/A"
+            group = totals.setdefault(currency, {
+                "currency": currency,
+                "count": 0,
+                "amount_untaxed": 0.0,
+                "amount_total": 0.0,
+                "amount_residual": 0.0,
+            })
+            group["count"] += 1
+            group["amount_untaxed"] += move.amount_untaxed
+            group["amount_total"] += move.amount_total
+            group["amount_residual"] += move.amount_residual
         return {
             "count": len(moves),
-            "amount_total": sum(moves.mapped("amount_total")),
-            "amount_residual": sum(moves.mapped("amount_residual")),
-            "currency": self.env.company.currency_id.name,
+            "totals": list(totals.values()),
+            "partner": partner_name or "todos",
         }

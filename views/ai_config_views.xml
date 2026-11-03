@@ -47,6 +47,14 @@
                         <page string="Modelos Odoo permitidos">
                             <field name="allowed_model_ids" widget="many2many_tags"/>
                         </page>
+                        <page string="Alias de modelos">
+                            <field name="keyword_ids">
+                                <list editable="bottom">
+                                    <field name="keyword"/>
+                                    <field name="model_id"/>
+                                </list>
+                            </field>
+                        </page>
                     </notebook>
                 </sheet>
             </form>

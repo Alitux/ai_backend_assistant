@@ -40,6 +40,9 @@ class AiConfig(models.Model):
         domain=[("transient", "=", False)],
         help="Solo estos modelos de Odoo puede consultar la IA.",
     )
+    keyword_ids = fields.One2many(
+        "ai.model.keyword", "config_id", string="Alias de modelos",
+    )
 
     def _sync_bot_partner(self):
         self.ensure_one()

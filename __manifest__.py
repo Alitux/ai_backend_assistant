@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     "name": "AI Backend Assistant",
-    "version": "19.0.1.6.0",
+    "version": "19.0.1.7.0",
     "summary": "Asistente IA para el backend de Odoo con tool calling",
     "description": """
         Asistente virtual para el backend de Odoo. Responde consultas sobre
